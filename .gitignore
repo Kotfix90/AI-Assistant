@@ -1,0 +1,22 @@
+# Виртуальные окружения
+agent_venv/
+api_venv/
+venv/
+.venv/
+env/
+
+# Кэш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Чекпоинты Jupyter Notebook
+.ipynb_checkpoints/
+
+# Переменные окружения и ключи
+.env
+
+# Настройки редакторов
+.vscode/
+.idea/
