@@ -1,4 +1,5 @@
-import asyncio
+# main.py
+
 import json
 from typing import AsyncGenerator
 
@@ -9,12 +10,11 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 import uvicorn
 
-# Импортируем скомпилированный граф из graphNew.py
 from graphNew import app_graph
+from nodes import clean_llm_response
 
 app = FastAPI(title="SmartKlimat74 AI Backend")
 
-# Настройка CORS для работы с веб-фронтендом
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,44 +30,59 @@ class ChatRequest(BaseModel):
     thread_id: str
 
 
-async def generate_chat_stream(
-    user_id: str, message: str, thread_id: str
-) -> AsyncGenerator[str, None]:
-    """Генератор SSE-событий с фильтрацией технических токенов LLM."""
+STREAMABLE_NODES = {"rag", "off_topic", "about_company", "checkout", "register"}
+
+
+async def generate_chat_stream(user_id: str, message: str, thread_id: str) -> AsyncGenerator[str, None]:
     config = {"configurable": {"thread_id": thread_id}}
     inputs = {"messages": [HumanMessage(content=message)], "user_id": user_id}
 
-    # Множество для отслеживания узлов, которые уже отстримили токены в реальном времени
     streamed_nodes = set()
+    logged_starts = set()
 
     try:
         async for event in app_graph.astream_events(inputs, config, version="v2"):
             kind = event["event"]
+            node_name = event.get("metadata", {}).get("langgraph_node")
 
-            # --- 1. Потоковый стриминг по токенам ---
+            # Логирование старта узлов
+            if kind == "on_chain_start" and node_name:
+                if node_name not in logged_starts:
+                    logged_starts.add(node_name)
+                    print(f"\n🚀 [LANGGRAPH NODE START]: ===> {node_name} <===")
+
+            elif kind == "on_chain_end":
+                name = event.get("name")
+                if name in ["route_question", "route_register_step"]:
+                    output = event["data"].get("output")
+                    print(f"🔀 [ROUTER DECISION]: {name} -> выбрал путь: '{output}'")
+
+            # -------------------------------------------------------------
+            # ПОТОКОВЫЙ ВЫВОД ПО ТОКЕНАМ ДЛЯ ВСЕХ ТЕКСТОВЫХ УЗЛОВ (ВКЛЮЧАЯ RAG)
+            # -------------------------------------------------------------
             if kind == "on_chat_model_stream":
-                node_name = event.get("metadata", {}).get("langgraph_node", "")
+                tags = event.get("tags", []) or []
 
-                # ВНИМАНИЕ: Стримятся токены ТОЛЬКО для узлов генерации обычного текста!
-                # Узел 'register' исключен, так как внутри него LLM генерирует служебный JSON (Pydantic schema).
-                if node_name in ["rag", "off_topic"]:
+                # Служебные вызовы (перефразирование запроса, классификация intent,
+                # извлечение имени/телефона/адреса, guardrail) помечены тегом "internal"
+                # в nodes.py и не должны попадать в поток к пользователю.
+                if "internal" in tags:
+                    continue
+
+                if node_name in STREAMABLE_NODES:
                     chunk = event["data"].get("chunk")
                     if chunk and hasattr(chunk, "content") and chunk.content:
-                        content = chunk.content
-                        # Проверяем, что это обычная текстовая строка, а не структура/tool_calls
-                        if isinstance(content, str) and content:
+                        token = chunk.content
+                        if isinstance(token, str) and token:
                             streamed_nodes.add(node_name)
-                            payload = json.dumps({"content": content}, ensure_ascii=False)
+                            payload = json.dumps({"content": token}, ensure_ascii=False)
                             yield f"data: {payload}\n\n"
-                            await asyncio.sleep(0.001)
 
-            # --- 2. Фолбэк/Цельный вывод по завершении работы узла ---
+            # -------------------------------------------------------------
+            # ФОЛЛБЕК: Если узел завершился, но стриминг токенов не сработал
+            # -------------------------------------------------------------
             elif kind == "on_chain_end":
-                node_name = event.get("name") or event.get("metadata", {}).get("langgraph_node")
-
-                # Список всех узлов, отправляющих финальные текстовые сообщения в state
-                if node_name in ["rag", "register", "off_topic", "checkout", "about_company"]:
-                    # Если узел НЕ стримил токены поштучно (например, register или about_company)
+                if node_name in STREAMABLE_NODES:
                     if node_name not in streamed_nodes:
                         output_data = event["data"].get("output", {})
                         if isinstance(output_data, dict) and "messages" in output_data:
@@ -76,15 +91,17 @@ async def generate_chat_stream(
                                 last_msg = messages[-1]
                                 content = getattr(last_msg, "content", "")
                                 if content and isinstance(content, str):
-                                    payload = json.dumps({"content": content}, ensure_ascii=False)
-                                    yield f"data: {payload}\n\n"
+                                    cleaned_content = clean_llm_response(content)
+                                    if cleaned_content:
+                                        streamed_nodes.add(node_name)
+                                        payload = json.dumps({"content": cleaned_content}, ensure_ascii=False)
+                                        yield f"data: {payload}\n\n"
 
     except Exception as e:
-        print(f"[STREAM ERROR]: {str(e)}")
+        print(f"❌ [STREAM ERROR]: {str(e)}")
         err_payload = json.dumps({"error": f"Ошибка сервера: {str(e)}"}, ensure_ascii=False)
         yield f"data: {err_payload}\n\n"
 
-    # Сигнал клиенту о завершении потока
     yield "data: [DONE]\n\n"
 
 
